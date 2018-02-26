@@ -6,6 +6,7 @@
 #include "meili/map_matcher.h"
 #include "meili/emission_cost_model.h"
 #include "meili/transition_cost_model.h"
+#include "loki/search.h"
 
 namespace {
 
@@ -672,6 +673,56 @@ MapMatcher::AppendMeasurements(const std::vector<Measurement>& measurements)
            sq_interpolation_distance = interpolation_distance * interpolation_distance;
   std::unordered_map<StateId::Time, std::vector<Measurement>> interpolated;
 
+  //figure out the ones that we will route with and the ones which will be interpolated
+  std::vector<size_t> indices;
+  std::vector<baldr::Location> locations;
+  StateId::Time time;
+  for (auto m = measurements.begin(); m != measurements.end(); ++m) {
+    if(m == measurements.begin()) {
+      locations.emplace_back(m->lnglat(), baldr::Location::StopType::BREAK, 0, std::max(m->gps_accuracy(), m->search_radius()));
+      indices.push_back(m - measurements.begin());
+      continue;
+    }
+    const auto sq_distance = GreatCircleDistanceSquared(*std::prev(m), *m);
+    if (sq_interpolation_distance < sq_distance || std::next(m) == measurements.end()) {
+      locations.emplace_back(m->lnglat(), baldr::Location::StopType::BREAK, 0, std::max(m->gps_accuracy(), m->search_radius()));
+      indices.push_back(m - measurements.begin());
+      ++time;
+    }
+    else {
+      interpolated[time].push_back(*m);
+    }
+  }
+
+  //find the candidates for all locations at once
+  auto correlations = loki::Search(locations, graphreader_, costing()->GetEdgeFilter(), costing()->GetNodeFilter());
+
+  //add the pairs of candidates to the states they belong with
+  for(time = 0; time < locations.size(); ++time) {
+    //fix the end time of the last uninterpolated point
+    if(time > 0 && indices[time] - indices[time - 1] > 1) {
+      const auto& last = locations[time - 1];
+      auto p = measurements[indices[time] - 1].lnglat().Project(last.latlng_, locations[time].latlng_);
+      if(p.Distance(last.latlng_)/last.latlng_.Distance(locations[time].latlng_) < .2f) {
+        container_.SetMeasurementLeaveTime(time - 1, measurements[indices[time] - 1].epoch_time());
+      }
+    }
+    //break the edges into pairs of opposing edges, TODO: let loki do this
+    container_.AppendMeasurement(measurements[indices[time]]);
+    const auto& correlated = correlations.at(locations[time]);
+    for(size_t k = 0; k < correlated.edges.size(); ++k) {
+      baldr::PathLocation candidate(locations[time]);
+      candidate.edges.push_back(correlated.edges[k]);
+      if(k + 1 < correlated.edges.size() && graphreader_.GetOpposingEdgeId(correlated.edges[k].id) == correlated.edges[k + 1].id)
+        candidate.edges.push_back(correlated.edges[++k]);
+      const auto& stateid = container_.AppendCandidate(candidate);
+      vs_.AddStateId(stateid);
+    }
+  }
+
+
+
+/*
   // Always match the first measurement
   auto last = measurements.cbegin();
   auto time = AppendMeasurement(*last, sq_max_search_radius);
@@ -704,7 +755,7 @@ MapMatcher::AppendMeasurements(const std::vector<Measurement>& measurements)
       interpolated[time].push_back(*m);
       interpolated_epoch_time = m->epoch_time();
     }
-  }
+  }*/
 
   return interpolated;
 }
